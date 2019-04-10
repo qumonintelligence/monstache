@@ -4,6 +4,7 @@ BUILD_DIR =build
 ENV_LINUX =env GOOS=linux GOARCH=amd64
 ENV_WIN =env GOOS=windows GOARCH=amd64
 ENV_DARWIN =env GOOS=darwin GOARCH=amd64
+ENV_CGO =env CGO_ENABLED=0 GOOS=linux GOARCH=amd64
 
 OUT_LINUX_DIR =$(BUILD_DIR)/linux-amd64
 OUT_WIN_DIR =$(BUILD_DIR)/windows-amd64
@@ -45,3 +46,6 @@ $(TARGET): $(TARGET).go
 	zip -r $(BUILD_DIR)/$(TARGET)-$(GIT_TAG).zip $(BUILD_DIR)
 clean:
 	$(RM) -R $(BUILD_DIR)
+
+cgo:
+	$(ENV_CGO) $(GB) $(LDFLAGS) -a -installsuffix cgo -v -o $(OUT_LINUX)
