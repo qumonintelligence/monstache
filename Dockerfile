@@ -21,7 +21,7 @@ RUN make cgo
 ####################################################################################################
 
 FROM scratch
+ENTRYPOINT ["/bin/monstache"]
 COPY --from=build-app /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 COPY --from=build-app /app/build/linux-amd64/monstache /bin/monstache
 CMD ["/bin/monstache"]
-

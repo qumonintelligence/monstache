@@ -4,14 +4,17 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"github.com/globalsign/mgo"
-	"github.com/olivere/elastic"
-	"github.com/rwynn/gtm"
-	"golang.org/x/net/context"
 	"math"
 	"os"
 	"testing"
 	"time"
+
+	"github.com/globalsign/mgo"
+	"github.com/globalsign/mgo/bson"
+	"github.com/olivere/elastic"
+	"github.com/rwynn/gtm"
+	"github.com/rwynn/monstache/monstachemap"
+	"golang.org/x/net/context"
 )
 
 /*
@@ -51,6 +54,7 @@ var elasticUrlConfig = elastic.SetURL(elasticUrl)
 var elasticNoSniffConfig = elastic.SetSniff(false)
 
 func init() {
+	testing.Init()
 	fmt.Printf("MongoDB Url: %v\nElasticsearch Url: %v\n", mongoUrl, elasticUrl)
 
 	flag.IntVar(&delay, "delay", 3, "Delay between operations in seconds")
@@ -78,6 +82,22 @@ func ValidateDocResponse(t *testing.T, doc map[string]string, resp *elastic.GetR
 	}
 }
 
+func TestMarshallEmptyArray(t *testing.T) {
+	var data = map[string]interface{}{
+		"data": make([]interface{}, 0),
+		"ints": []interface{}{1, 2, 3},
+	}
+	b, err := json.Marshal(monstachemap.ConvertMapForJSON(data))
+	if err != nil {
+		t.Fatalf("Unable to marshal object: %s", err)
+	}
+	expectedJSON := "{\"data\":[],\"ints\":[1,2,3]}"
+	actualJSON := string(b)
+	if actualJSON != expectedJSON {
+		t.Fatalf("Expected %s but got %s", expectedJSON, actualJSON)
+	}
+}
+
 func TestParseElasticsearchVersion(t *testing.T) {
 	var err error
 	c := &configOptions{}
@@ -98,6 +118,62 @@ func TestParseElasticsearchVersion(t *testing.T) {
 	err = c.parseElasticsearchVersion("0")
 	if err == nil {
 		t.Fatalf("Expected error for invalid version")
+	}
+}
+
+func TestExtractRelateData(t *testing.T) {
+	data, err := extractData("foo", map[string]interface{}{"foo": 1})
+	if err != nil {
+		t.Fatalf("Expected nil error")
+	}
+	if data != 1 {
+		t.Fatalf("Expected extracting foo value of 1")
+	}
+	data, err = extractData("foo.bar", map[string]interface{}{"foo": map[string]interface{}{"bar": 1}})
+	if err != nil {
+		t.Fatalf("Expected nil error")
+	}
+	if data != 1 {
+		t.Fatalf("Expected extracting foo.bar value of 1")
+	}
+	data, err = extractData("foo.bar", map[string]interface{}{"foo": map[string]interface{}{"foo": 1}})
+	if err == nil {
+		t.Fatalf("Expected error for missing key")
+	}
+	data, err = extractData("foo", map[string]interface{}{"bar": 1})
+	if err == nil {
+		t.Fatalf("Expected error for missing key")
+	}
+	data, err = extractData("foo.bar", map[string]interface{}{"foo": []string{"a", "b", "c"}})
+	if err == nil {
+		t.Fatalf("Expected error for missing key")
+	}
+}
+
+func TestBuildRelateSelector(t *testing.T) {
+	sel := buildSelector("foo", 1)
+	if sel == nil {
+		t.Fatalf("Expected non-nil selector")
+	}
+	if len(sel) != 1 {
+		t.Fatalf("Expected 1 foo key in selector")
+	}
+	if sel["foo"] != 1 {
+		t.Fatalf("Expected matching foo to 1: %v", sel)
+	}
+	sel = buildSelector("foo.bar", 1)
+	if sel == nil {
+		t.Fatalf("Expected non-nil selector")
+	}
+	if len(sel) != 1 {
+		t.Fatalf("Expected 1 foo key in selector")
+	}
+	bar, ok := sel["foo"].(bson.M)
+	if !ok {
+		t.Fatalf("Expected nested selector under foo")
+	}
+	if bar["bar"] != 1 {
+		t.Fatalf("Expected matching foo.bar to 1: %v", sel)
 	}
 }
 

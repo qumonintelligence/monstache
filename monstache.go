@@ -10,22 +10,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"github.com/BurntSushi/toml"
-	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/coreos/go-systemd/daemon"
-	"github.com/evanphx/json-patch"
-	"github.com/globalsign/mgo"
-	"github.com/globalsign/mgo/bson"
-	"github.com/olivere/elastic"
-	aws "github.com/olivere/elastic/aws/v4"
-	"github.com/robertkrimen/otto"
-	_ "github.com/robertkrimen/otto/underscore"
-	"github.com/rwynn/gtm"
-	"github.com/rwynn/gtm/consistent"
-	"github.com/rwynn/monstache/monstachemap"
-	"golang.org/x/net/context"
-	"gopkg.in/Graylog2/go-gelf.v2/gelf"
-	"gopkg.in/natefinch/lumberjack.v2"
 	"io"
 	"io/ioutil"
 	"log"
@@ -43,6 +27,23 @@ import (
 	"syscall"
 	"text/template"
 	"time"
+
+	"github.com/BurntSushi/toml"
+	"github.com/aws/aws-sdk-go/aws/credentials"
+	"github.com/coreos/go-systemd/daemon"
+	jsonpatch "github.com/evanphx/json-patch"
+	"github.com/globalsign/mgo"
+	"github.com/globalsign/mgo/bson"
+	"github.com/olivere/elastic"
+	aws "github.com/olivere/elastic/aws/v4"
+	"github.com/robertkrimen/otto"
+	_ "github.com/robertkrimen/otto/underscore"
+	"github.com/rwynn/gtm"
+	"github.com/rwynn/gtm/consistent"
+	"github.com/rwynn/monstache/monstachemap"
+	"golang.org/x/net/context"
+	"gopkg.in/Graylog2/go-gelf.v2/gelf"
+	"gopkg.in/natefinch/lumberjack.v2"
 )
 
 var infoLog = log.New(os.Stdout, "INFO ", log.Flags())
@@ -55,23 +56,24 @@ var mapperPlugin func(*monstachemap.MapperPluginInput) (*monstachemap.MapperPlug
 var filterPlugin func(*monstachemap.MapperPluginInput) (bool, error)
 var processPlugin func(*monstachemap.ProcessPluginInput) error
 var pipePlugin func(string, bool) ([]interface{}, error)
-var mapEnvs map[string]*executionEnv = make(map[string]*executionEnv)
-var filterEnvs map[string]*executionEnv = make(map[string]*executionEnv)
-var pipeEnvs map[string]*executionEnv = make(map[string]*executionEnv)
-var mapIndexTypes map[string]*indexTypeMapping = make(map[string]*indexTypeMapping)
-var relates map[string][]*relation = make(map[string][]*relation)
-var fileNamespaces map[string]bool = make(map[string]bool)
-var patchNamespaces map[string]bool = make(map[string]bool)
-var tmNamespaces map[string]bool = make(map[string]bool)
-var routingNamespaces map[string]bool = make(map[string]bool)
+var mapEnvs = make(map[string]*executionEnv)
+var filterEnvs = make(map[string]*executionEnv)
+var pipeEnvs = make(map[string]*executionEnv)
+var mapIndexTypes = make(map[string]*indexTypeMapping)
+var relates = make(map[string][]*relation)
+var fileNamespaces = make(map[string]bool)
+var patchNamespaces = make(map[string]bool)
+var tmNamespaces = make(map[string]bool)
+var routingNamespaces = make(map[string]bool)
 var mux sync.Mutex
 
 var chunksRegex = regexp.MustCompile("\\.chunks$")
 var systemsRegex = regexp.MustCompile("system\\..+$")
 var exitStatus = 0
 var mongoDialInfo *mgo.DialInfo
+var statusReqC = make(chan *statusRequest)
 
-const version = "4.16.1"
+const version = "4.19.6"
 const mongoURLDefault string = "localhost"
 const resumeNameDefault string = "default"
 const elasticMaxConnsDefault int = 4
@@ -123,6 +125,8 @@ type relation struct {
 	SrcField      string `toml:"src-field"`
 	MatchField    string `toml:"match-field"`
 	KeepSrc       bool   `toml:"keep-src"`
+	DotNotation   bool   `toml:"dot-notation"`
+	MaxDepth      int    `toml:"max-depth"`
 	db            string
 	col           string
 }
@@ -215,6 +219,25 @@ type httpServerCtx struct {
 	started    time.Time
 }
 
+type instanceStatus struct {
+	Enabled      bool                `json:"enabled"`
+	Pid          int                 `json:"pid"`
+	Hostname     string              `json:"hostname"`
+	ClusterName  string              `json:"cluster"`
+	ResumeName   string              `json:"resumeName"`
+	LastTs       bson.MongoTimestamp `json:"lastTs"`
+	LastTsFormat string              `json:"lastTsFormat,omitempty"`
+}
+
+type statusResponse struct {
+	enabled bool
+	lastTs  bson.MongoTimestamp
+}
+
+type statusRequest struct {
+	responseC chan *statusResponse
+}
+
 type configOptions struct {
 	EnableTemplate           bool
 	EnvDelimiter             string
@@ -296,6 +319,7 @@ type configOptions struct {
 	DirectReadNs             stringargs     `toml:"direct-read-namespaces"`
 	DirectReadSplitMax       int            `toml:"direct-read-split-max"`
 	DirectReadConcur         int            `toml:"direct-read-concur"`
+	DirectReadNoTimeout      bool           `toml:"direct-read-no-timeout"`
 	MapperPluginPath         string         `toml:"mapper-plugin-path"`
 	EnableHTTPServer         bool           `toml:"enable-http-server"`
 	HTTPServerAddr           string         `toml:"http-server-addr"`
@@ -314,6 +338,14 @@ type configOptions struct {
 	PostProcessors           int            `toml:"post-processors"`
 	PruneInvalidJSON         bool           `toml:"prune-invalid-json"`
 	Debug                    bool
+}
+
+func (rel *relation) IsIdentity() bool {
+	if rel.SrcField == "_id" && rel.MatchField == "_id" {
+		return true
+	} else {
+		return false
+	}
 }
 
 func (l *logFiles) enabled() bool {
@@ -380,6 +412,11 @@ func afterBulk(executionId int64, requests []elastic.BulkableRequest, response *
 		failed := response.Failed()
 		if failed != nil {
 			for _, item := range failed {
+				if item.Status == 409 {
+					// ignore version conflict since this simply means the doc
+					// is already in the index
+					continue
+				}
 				json, err := json.Marshal(item)
 				if err != nil {
 					errorLog.Printf("Unable to marshal bulk response item: %s", err)
@@ -508,17 +545,23 @@ func (config *configOptions) testElasticsearchConn(client *elastic.Client) (err 
 }
 
 func deleteIndexes(client *elastic.Client, db string, config *configOptions) (err error) {
-	index := strings.ToLower(db + "*")
+	var indices = []string{strings.ToLower(db + ".*")}
 	for ns, m := range mapIndexTypes {
 		dbCol := strings.SplitN(ns, ".", 2)
-		if dbCol[0] == db {
-			if m.Index != "" {
-				index = strings.ToLower(m.Index + "*")
+		if dbCol[0] == db && m.Index != "" {
+			index := strings.ToLower(m.Index)
+			for _, cur := range indices {
+				if cur == index {
+					index = ""
+					break
+				}
 			}
-			break
+			if index != "" {
+				indices = append(indices, index)
+			}
 		}
 	}
-	_, err = client.DeleteIndex(index).Do(context.Background())
+	_, err = client.DeleteIndex(indices...).Do(context.Background())
 	return
 }
 
@@ -577,19 +620,21 @@ func mapIndexType(config *configOptions, op *gtm.Op) *indexTypeMapping {
 
 func opIDToString(op *gtm.Op) string {
 	var opIDStr string
-	switch op.Id.(type) {
+	switch id := op.Id.(type) {
 	case bson.ObjectId:
-		opIDStr = op.Id.(bson.ObjectId).Hex()
+		opIDStr = id.Hex()
+	case bson.Binary:
+		opIDStr = monstachemap.EncodeBinData(monstachemap.Binary{id})
 	case float64:
-		intID := int(op.Id.(float64))
-		if op.Id.(float64) == float64(intID) {
+		intID := int(id)
+		if id == float64(intID) {
 			opIDStr = fmt.Sprintf("%v", intID)
 		} else {
 			opIDStr = fmt.Sprintf("%v", op.Id)
 		}
 	case float32:
-		intID := int(op.Id.(float32))
-		if op.Id.(float32) == float32(intID) {
+		intID := int(id)
+		if id == float32(intID) {
 			opIDStr = fmt.Sprintf("%v", intID)
 		} else {
 			opIDStr = fmt.Sprintf("%v", op.Id)
@@ -869,98 +914,169 @@ func mapData(session *mgo.Session, config *configOptions, op *gtm.Op) error {
 	return mapDataJavascript(op)
 }
 
-func processRelated(session *mgo.Session, config *configOptions, op *gtm.Op, out *outputChans) (err error) {
-	if op.Data == nil {
-		return nil
-	}
-	rs := relates[op.Namespace]
-	if len(rs) == 0 {
-		return nil
-	}
-	for _, r := range rs {
-		if op.Data[r.SrcField] == nil {
-			b, e := json.Marshal(op.Data)
-			if e == nil {
-				err = fmt.Errorf("Source field %s not found for relation: %s", r.SrcField, string(b))
+func extractData(srcField string, data map[string]interface{}) (result interface{}, err error) {
+	var cur map[string]interface{} = data
+	fields := strings.Split(srcField, ".")
+	flen := len(fields)
+	for i, field := range fields {
+		if i+1 == flen {
+			result = cur[field]
+		} else {
+			if next, ok := cur[field].(map[string]interface{}); ok {
+				cur = next
 			} else {
-				err = fmt.Errorf("Source field %s not found for relation: %s", r.SrcField, err)
+				break
 			}
-			processErr(err, config)
-			continue
 		}
-		s := session.Copy()
-		sel := bson.M{r.MatchField: op.Data[r.SrcField]}
-		col := s.DB(r.db).C(r.col)
-		q := col.Find(sel)
-		iter := q.Iter()
-		doc := make(map[string]interface{})
-		for iter.Next(doc) {
-			now := time.Now().UTC()
-			tstamp := bson.MongoTimestamp(now.Unix() << 32)
-			offset := bson.MongoTimestamp(now.Nanosecond())
-			rop := &gtm.Op{
-				Id:                doc["_id"],
-				Data:              doc,
-				Operation:         op.Operation,
-				Namespace:         r.WithNamespace,
-				Source:            gtm.DirectQuerySource,
-				Timestamp:         tstamp | offset,
-				UpdateDescription: op.UpdateDescription,
-			}
-			doc = map[string]interface{}{}
-			if out.filter != nil && !out.filter(rop) {
+	}
+	if result == nil {
+		var detail interface{}
+		b, e := json.Marshal(data)
+		if e == nil {
+			detail = string(b)
+		} else {
+			detail = err
+		}
+		err = fmt.Errorf("Source field %s not found in document: %s", srcField, detail)
+	}
+	return
+}
+
+func buildSelector(matchField string, data interface{}) bson.M {
+	sel := bson.M{}
+	var cur bson.M = sel
+	fields := strings.Split(matchField, ".")
+	flen := len(fields)
+	for i, field := range fields {
+		if i+1 == flen {
+			cur[field] = data
+		} else {
+			next := bson.M{}
+			cur[field] = next
+			cur = next
+		}
+	}
+	return sel
+}
+
+func processRelated(session *mgo.Session, bulk *elastic.BulkProcessor, elastic *elastic.Client, config *configOptions, root *gtm.Op, out *outputChans) (err error) {
+	var q []*gtm.Op
+	batch := []*gtm.Op{root}
+	depth := 1
+	s := session.Copy()
+	if config.DirectReadNoTimeout {
+		s.SetCursorTimeout(0)
+	}
+	defer s.Close()
+	for len(batch) > 0 {
+		for _, e := range batch {
+			op := e
+			if op.Data == nil {
 				continue
 			}
-			if processPlugin != nil {
-				pop := &gtm.Op{
-					Id:                rop.Id,
-					Operation:         rop.Operation,
-					Namespace:         rop.Namespace,
-					Source:            rop.Source,
-					Timestamp:         rop.Timestamp,
-					UpdateDescription: rop.UpdateDescription,
-				}
-				var data []byte
-				data, err = bson.Marshal(rop.Data)
-				if err == nil {
-					var m map[string]interface{}
-					err = bson.Unmarshal(data, &m)
-					if err == nil {
-						pop.Data = m
-					}
-				}
-				out.processC <- pop
+			rs := relates[op.Namespace]
+			if len(rs) == 0 {
+				continue
 			}
-			skip := false
-			if rs2 := relates[rop.Namespace]; len(rs2) != 0 {
-				skip = true
-				for _, r2 := range rs2 {
-					if r2.KeepSrc {
-						skip = false
-					}
-					if rop.Data[r2.SrcField] != nil {
-						err = processRelated(session, config, rop, out)
-					} else {
-						b, e := json.Marshal(rop.Data)
-						if e == nil {
-							err = fmt.Errorf("Source field %s not found for relation: %s", r2.SrcField, string(b))
-						} else {
-							err = fmt.Errorf("Source field %s not found for relation: %s", r2.SrcField, e)
-						}
-						processErr(err, config)
-					}
+			for _, r := range rs {
+				if r.MaxDepth > 0 && r.MaxDepth < depth {
+					continue
 				}
-			}
-			if !skip {
-				if hasFileContent(rop, config) {
-					out.fileC <- rop
+				if op.IsDelete() && r.IsIdentity() {
+					rop := &gtm.Op{
+						Id:        op.Id,
+						Operation: op.Operation,
+						Namespace: r.WithNamespace,
+						Source:    op.Source,
+						Timestamp: op.Timestamp,
+						Data:      op.Data,
+					}
+					doDelete(config, elastic, session, bulk, rop)
+					q = append(q, rop)
+					continue
+				}
+				var srcData interface{}
+				if srcData, err = extractData(r.SrcField, op.Data); err != nil {
+					processErr(err, config)
+					continue
+				}
+				var sel bson.M
+				if r.DotNotation {
+					sel = bson.M{r.MatchField: srcData}
 				} else {
-					out.indexC <- rop
+					sel = buildSelector(r.MatchField, srcData)
 				}
+				col := s.DB(r.db).C(r.col)
+				query := col.Find(sel)
+				iter := query.Iter()
+				doc := map[string]interface{}{}
+				for iter.Next(doc) {
+					now := time.Now().UTC()
+					tstamp := bson.MongoTimestamp(now.Unix() << 32)
+					offset := bson.MongoTimestamp(now.Nanosecond())
+					rop := &gtm.Op{
+						Id:                doc["_id"],
+						Data:              doc,
+						Operation:         root.Operation,
+						Namespace:         r.WithNamespace,
+						Source:            gtm.DirectQuerySource,
+						Timestamp:         tstamp | offset,
+						UpdateDescription: root.UpdateDescription,
+					}
+					doc = map[string]interface{}{}
+					if out.filter != nil && !out.filter(rop) {
+						continue
+					}
+					if processPlugin != nil {
+						pop := &gtm.Op{
+							Id:                rop.Id,
+							Operation:         rop.Operation,
+							Namespace:         rop.Namespace,
+							Source:            rop.Source,
+							Timestamp:         rop.Timestamp,
+							UpdateDescription: rop.UpdateDescription,
+						}
+						var data []byte
+						data, err = bson.Marshal(rop.Data)
+						if err == nil {
+							var m map[string]interface{}
+							err = bson.Unmarshal(data, &m)
+							if err == nil {
+								pop.Data = m
+							}
+						}
+						out.processC <- pop
+					}
+					skip := false
+					if rs2 := relates[rop.Namespace]; len(rs2) != 0 {
+						skip = true
+						visit := false
+						for _, r2 := range rs2 {
+							if r2.KeepSrc {
+								skip = false
+							}
+							if r2.MaxDepth < 1 || r2.MaxDepth >= (depth+1) {
+								visit = true
+							}
+						}
+						if visit {
+							q = append(q, rop)
+						}
+					}
+					if !skip {
+						if hasFileContent(rop, config) {
+							out.fileC <- rop
+						} else {
+							out.indexC <- rop
+						}
+					}
+				}
+				iter.Close()
 			}
 		}
-		iter.Close()
-		s.Close()
+		depth++
+		batch = q
+		q = nil
 	}
 	return
 }
@@ -978,6 +1094,7 @@ func prepareDataForIndexing(config *configOptions, op *gtm.Op) {
 	if config.PruneInvalidJSON {
 		op.Data = fixPruneInvalidJSON(opIDToString(op), data)
 	}
+	op.Data = monstachemap.ConvertMapForJSON(op.Data)
 }
 
 func parseIndexMeta(op *gtm.Op) (meta *indexingMeta) {
@@ -1103,7 +1220,7 @@ func filterWithPlugin() gtm.OpFilter {
 
 func filterWithScript() gtm.OpFilter {
 	return func(op *gtm.Op) bool {
-		var keep bool = true
+		var keep = true
 		if (op.IsInsert() || op.IsUpdate()) && op.Data != nil {
 			nss := []string{"", op.Namespace}
 			for _, ns := range nss {
@@ -1169,15 +1286,16 @@ func enableProcess(s *mgo.Session, config *configOptions) (bool, error) {
 	col := session.DB(config.ConfigDatabaseName).C("cluster")
 	doc := make(map[string]interface{})
 	doc["_id"] = config.ResumeName
-	doc["expireAt"] = time.Now().UTC()
 	doc["pid"] = os.Getpid()
 	if host, err := os.Hostname(); err == nil {
 		doc["host"] = host
 	} else {
 		return false, err
 	}
+	doc["expireAt"] = time.Now().UTC()
 	err := col.Insert(doc)
 	if err == nil {
+		ensureEnabled(s, config)
 		return true, nil
 	}
 	if mgo.IsDup(err) {
@@ -1205,7 +1323,7 @@ func ensureEnabled(s *mgo.Session, config *configOptions) (enabled bool, err err
 				enabled = (pid == os.Getpid() && host == hostname)
 				if enabled {
 					err = col.UpdateId(config.ResumeName,
-						bson.M{"$set": bson.M{"expireAt": time.Now().UTC()}})
+						bson.M{"$currentDate": bson.M{"expireAt": true}})
 				}
 			}
 		}
@@ -1220,6 +1338,17 @@ func resumeWork(ctx *gtm.OpCtxMulti, session *mgo.Session, config *configOptions
 	if doc["ts"] != nil {
 		ts := doc["ts"].(bson.MongoTimestamp)
 		ctx.Since(ts)
+	}
+	drained := false
+	for !drained {
+		select {
+		case _, open := <-ctx.OpC:
+			if !open {
+				drained = true
+			}
+		default:
+			drained = true
+		}
 	}
 	ctx.Resume()
 }
@@ -1300,11 +1429,12 @@ func (config *configOptions) parseCommandLineFlags() *configOptions {
 	flag.Var(&config.ChangeStreamNs, "change-stream-namespace", "A list of change stream namespaces")
 	flag.Var(&config.DirectReadNs, "direct-read-namespace", "A list of direct read namespaces")
 	flag.IntVar(&config.DirectReadSplitMax, "direct-read-split-max", 0, "Max number of times to split a collection for direct reads")
-	flag.IntVar(&config.DirectReadConcur, "direct-read-concur", 0, "Max number of direct-read-namespaces to read concurrently. By default all givne are read concurrently")
+	flag.IntVar(&config.DirectReadConcur, "direct-read-concur", 0, "Max number of direct-read-namespaces to read concurrently. By default all given are read concurrently")
 	flag.Var(&config.RoutingNamespaces, "routing-namespace", "A list of namespaces that override routing information")
 	flag.Var(&config.TimeMachineNamespaces, "time-machine-namespace", "A list of direct read namespaces")
 	flag.StringVar(&config.TimeMachineIndexPrefix, "time-machine-index-prefix", "", "A prefix to preprend to time machine indexes")
 	flag.StringVar(&config.TimeMachineIndexSuffix, "time-machine-index-suffix", "", "A suffix to append to time machine indexes")
+	flag.BoolVar(&config.DirectReadNoTimeout, "direct-read-no-timeout", false, "True to set the no cursor timeout flag for direct reads")
 	flag.BoolVar(&config.TimeMachineDirectReads, "time-machine-direct-reads", false, "True to index the results of direct reads into the any time machine indexes")
 	flag.BoolVar(&config.PipeAllowDisk, "pipe-allow-disk", false, "True to allow MongoDB to use the disk for pipeline options with lots of results")
 	flag.Var(&config.ElasticUrls, "elasticsearch-url", "A list of Elasticsearch URLs")
@@ -1339,7 +1469,9 @@ func (config *configOptions) loadReplacements() {
 					WithNamespace: r.WithNamespace,
 					SrcField:      r.SrcField,
 					MatchField:    r.MatchField,
+					DotNotation:   r.DotNotation,
 					KeepSrc:       r.KeepSrc,
+					MaxDepth:      r.MaxDepth,
 					db:            database,
 					col:           collection,
 				}
@@ -1580,13 +1712,14 @@ func (config *configOptions) decodeAsTemplate() *configOptions {
 func (config *configOptions) loadConfigFile() *configOptions {
 	if config.ConfigFile != "" {
 		var tomlConfig = configOptions{
-			ConfigFile:           config.ConfigFile,
-			DroppedDatabases:     true,
-			DroppedCollections:   true,
-			MongoValidatePemFile: true,
-			MongoDialSettings:    mongoDialSettings{Timeout: -1, ReadTimeout: -1, WriteTimeout: -1},
-			MongoSessionSettings: mongoSessionSettings{SocketTimeout: -1, SyncTimeout: -1},
-			GtmSettings:          gtmDefaultSettings(),
+			ConfigFile:             config.ConfigFile,
+			DroppedDatabases:       true,
+			DroppedCollections:     true,
+			MongoValidatePemFile:   true,
+			ElasticValidatePemFile: true,
+			MongoDialSettings:      mongoDialSettings{Timeout: -1, ReadTimeout: -1, WriteTimeout: -1},
+			MongoSessionSettings:   mongoSessionSettings{SocketTimeout: -1, SyncTimeout: -1},
+			GtmSettings:            gtmDefaultSettings(),
 		}
 		if config.EnableTemplate {
 			tomlConfig.decodeAsTemplate()
@@ -1642,6 +1775,9 @@ func (config *configOptions) loadConfigFile() *configOptions {
 		}
 		if config.DirectReadConcur == 0 {
 			config.DirectReadConcur = tomlConfig.DirectReadConcur
+		}
+		if !config.DirectReadNoTimeout && tomlConfig.DirectReadNoTimeout {
+			config.DirectReadNoTimeout = true
 		}
 		if !config.ElasticRetry && tomlConfig.ElasticRetry {
 			config.ElasticRetry = true
@@ -1938,6 +2074,13 @@ func (config *configOptions) loadEnvironment() *configOptions {
 				config.MongoPemFile = val
 			}
 			break
+		case "MONSTACHE_MONGO_VALIDATE_PEM":
+			v, err := strconv.ParseBool(val)
+			if err != nil {
+				errorLog.Fatalf("Failed to load MONSTACHE_MONGO_VALIDATE_PEM: %s", err)
+			}
+			config.MongoValidatePemFile = v
+			break
 		case "MONSTACHE_MONGO_OPLOG_DB":
 			if config.MongoOpLogDatabaseName == "" {
 				config.MongoOpLogDatabaseName = val
@@ -1967,6 +2110,13 @@ func (config *configOptions) loadEnvironment() *configOptions {
 			if config.ElasticPemFile == "" {
 				config.ElasticPemFile = val
 			}
+			break
+		case "MONSTACHE_ES_VALIDATE_PEM":
+			v, err := strconv.ParseBool(val)
+			if err != nil {
+				errorLog.Fatalf("Failed to load MONSTACHE_ES_VALIDATE_PEM: %s", err)
+			}
+			config.ElasticValidatePemFile = v
 			break
 		case "MONSTACHE_WORKER":
 			if config.Worker == "" {
@@ -2441,7 +2591,7 @@ func (config *configOptions) NewHTTPClient() (client *http.Client, err error) {
 		certs := x509.NewCertPool()
 		if ca, err = ioutil.ReadFile(config.ElasticPemFile); err == nil {
 			if ok := certs.AppendCertsFromPEM(ca); !ok {
-				errorLog.Printf("No certs parsed successfully from %s", config.MongoPemFile)
+				errorLog.Printf("No certs parsed successfully from %s", config.ElasticPemFile)
 			}
 			tlsConfig.RootCAs = certs
 		} else {
@@ -2678,8 +2828,8 @@ func doIndexing(config *configOptions, mongo *mgo.Session, bulk *elastic.BulkPro
 			t := time.Now().UTC()
 			tmIndex := func(idx string) string {
 				pre, suf := config.TimeMachineIndexPrefix, config.TimeMachineIndexSuffix
-				tmFormat := strings.Join([]string{pre, idx, suf}, ".")
-				return strings.ToLower(t.Format(tmFormat))
+				tmFormat := strings.Join([]string{pre, idx, t.Format(suf)}, ".")
+				return strings.ToLower(tmFormat)
 			}
 			data := make(map[string]interface{})
 			for k, v := range op.Data {
@@ -2903,16 +3053,20 @@ func doIndexStats(config *configOptions, bulkStats *elastic.BulkProcessor, stats
 }
 
 func dropDBMeta(session *mgo.Session, db string, config *configOptions) (err error) {
-	col := session.DB(config.ConfigDatabaseName).C("meta")
-	q := bson.M{"db": db}
-	_, err = col.RemoveAll(q)
+	if config.DeleteStrategy == statefulDeleteStrategy {
+		col := session.DB(config.ConfigDatabaseName).C("meta")
+		q := bson.M{"db": db}
+		_, err = col.RemoveAll(q)
+	}
 	return
 }
 
 func dropCollectionMeta(session *mgo.Session, namespace string, config *configOptions) (err error) {
-	col := session.DB(config.ConfigDatabaseName).C("meta")
-	q := bson.M{"namespace": namespace}
-	_, err = col.RemoveAll(q)
+	if config.DeleteStrategy == statefulDeleteStrategy {
+		col := session.DB(config.ConfigDatabaseName).C("meta")
+		q := bson.M{"namespace": namespace}
+		_, err = col.RemoveAll(q)
+	}
 	return
 }
 
@@ -3317,7 +3471,7 @@ func makeFind(fa *findConf) func(otto.FunctionCall) otto.Value {
 				var result otto.Value
 				if result, err = fc.execute(); err == nil {
 					r = result
-				} else {
+				} else if err != mgo.ErrNotFound {
 					fc.logError(err)
 				}
 			} else {
@@ -3492,6 +3646,52 @@ func (ctx *httpServerCtx) buildServer() {
 			}
 		})
 	}
+	mux.HandleFunc("/instance", func(w http.ResponseWriter, req *http.Request) {
+		hostname, err := os.Hostname()
+		if err != nil {
+			w.WriteHeader(500)
+			fmt.Fprintf(w, "Unable to get hostname for instance info: %s", err)
+			return
+		}
+		status := instanceStatus{
+			Pid:         os.Getpid(),
+			Hostname:    hostname,
+			ResumeName:  ctx.config.ResumeName,
+			ClusterName: ctx.config.ClusterName,
+		}
+		respC := make(chan *statusResponse)
+		statusReq := &statusRequest{
+			responseC: respC,
+		}
+		timer := time.NewTimer(5 * time.Second)
+		defer timer.Stop()
+		select {
+		case statusReqC <- statusReq:
+			srsp := <-respC
+			if srsp != nil {
+				status.Enabled = srsp.enabled
+				status.LastTs = srsp.lastTs
+				if srsp.lastTs != 0 {
+					status.LastTsFormat = time.Unix(int64(srsp.lastTs>>32), 0).Format("2006-01-02T15:04:05")
+				}
+			}
+			data, err := json.Marshal(status)
+			if err != nil {
+				w.WriteHeader(500)
+				fmt.Fprintf(w, "Unable to print instance info: %s", err)
+				break
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(200)
+			w.Write(data)
+			fmt.Fprintln(w)
+			break
+		case <-timer.C:
+			w.WriteHeader(500)
+			fmt.Fprintf(w, "Timeout getting instance info")
+			break
+		}
+	})
 	if ctx.config.Pprof {
 		mux.HandleFunc("/debug/pprof/", pprof.Index)
 		mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
@@ -3615,10 +3815,10 @@ func shutdown(timeout int, hsc *httpServerCtx, bulk *elastic.BulkProcessor, bulk
 			hsc.httpServer.Shutdown(context.Background())
 		}
 		if bulk != nil {
-			bulk.Flush()
+			bulk.Stop()
 		}
 		if bulkStats != nil {
-			bulkStats.Flush()
+			bulkStats.Stop()
 		}
 		close(closeC)
 	}()
@@ -3647,6 +3847,21 @@ func handlePanic() {
 		infoLog.Println("Shutting down with exit status 1 after panic.")
 		time.Sleep(3 * time.Second)
 		os.Exit(1)
+	}
+}
+
+func saveTimestampFromReplStatus(session *mgo.Session, config *configOptions) {
+	if rs, err := gtm.GetReplStatus(session); err == nil {
+		var ts bson.MongoTimestamp
+		if ts, err = rs.GetLastCommitted(); err == nil {
+			if err = saveTimestamp(session, ts, config); err != nil {
+				processErr(err, config)
+			}
+		} else {
+			processErr(err, config)
+		}
+	} else {
+		processErr(err, config)
 	}
 }
 
@@ -3720,6 +3935,28 @@ func main() {
 		}
 		defer bulkStats.Stop()
 	}
+
+	go notifySd(config)
+	var hsc *httpServerCtx
+	if config.EnableHTTPServer {
+		hsc = &httpServerCtx{
+			bulk:   bulk,
+			config: config,
+		}
+		hsc.buildServer()
+		go hsc.serveHttp()
+	}
+
+	eventLoopC := make(chan bool)
+	go func() {
+		select {
+		case <-eventLoopC:
+			return
+		case <-sigs:
+			os.Exit(exitStatus)
+			break
+		}
+	}()
 
 	var after gtm.TimestampGenerator
 	if config.Replay {
@@ -3861,6 +4098,7 @@ func main() {
 		DirectReadNs:        config.DirectReadNs,
 		DirectReadSplitMax:  config.DirectReadSplitMax,
 		DirectReadConcur:    config.DirectReadConcur,
+		DirectReadNoTimeout: config.DirectReadNoTimeout,
 		DirectReadFilter:    directReadFilter,
 		Log:                 infoLog,
 		Pipe:                buildPipe(config),
@@ -3868,26 +4106,41 @@ func main() {
 		ChangeStreamNs:      changeStreamNs,
 	}
 
-	gtmCtx := gtm.StartMulti(mongos, gtmOpts)
-
-	if config.readShards() && !config.DisableChangeEvents {
-		gtmCtx.AddShardListener(configSession, gtmOpts, config.makeShardInsertHandler())
-	}
+	heartBeat := time.NewTicker(10 * time.Second)
 	if config.ClusterName != "" {
 		if enabled {
 			infoLog.Printf("Starting work for cluster %s", config.ClusterName)
 		} else {
 			infoLog.Printf("Pausing work for cluster %s", config.ClusterName)
-			gtmCtx.Pause()
+			bulk.Stop()
+			wait := true
+			for wait {
+				select {
+				case req := <-statusReqC:
+					req.responseC <- nil
+				case <-heartBeat.C:
+					enabled, err = enableProcess(mongo, config)
+					if enabled {
+						wait = false
+						infoLog.Printf("Resuming work for cluster %s", config.ClusterName)
+						bulk.Start(context.Background())
+						break
+					}
+				}
+			}
 		}
+	} else {
+		heartBeat.Stop()
+	}
+
+	gtmCtx := gtm.StartMulti(mongos, gtmOpts)
+
+	if config.readShards() && !config.DisableChangeEvents {
+		gtmCtx.AddShardListener(configSession, gtmOpts, config.makeShardInsertHandler())
 	}
 	timestampTicker := time.NewTicker(10 * time.Second)
 	if config.Resume == false {
 		timestampTicker.Stop()
-	}
-	heartBeat := time.NewTicker(10 * time.Second)
-	if config.ClusterName == "" {
-		heartBeat.Stop()
 	}
 	statsTimeout := time.Duration(30) * time.Second
 	if config.StatsDuration != "" {
@@ -3900,24 +4153,6 @@ func main() {
 	if config.Stats == false {
 		printStats.Stop()
 	}
-	go notifySd(config)
-	var hsc *httpServerCtx
-	if config.EnableHTTPServer {
-		hsc = &httpServerCtx{
-			bulk:   bulk,
-			config: config,
-		}
-		hsc.buildServer()
-		go hsc.serveHttp()
-	}
-	go func() {
-		<-sigs
-		if enabled {
-			shutdown(10, hsc, bulk, bulkStats, mongo, config)
-		} else {
-			shutdown(10, hsc, nil, nil, nil, config)
-		}
-	}()
 	var lastTimestamp, lastSavedTimestamp bson.MongoTimestamp
 	var allOpsVisited bool
 	var fileWg, indexWg, processWg, relateWg sync.WaitGroup
@@ -3936,7 +4171,7 @@ func main() {
 			go func() {
 				defer relateWg.Done()
 				for op := range outputChs.relateC {
-					if err := processRelated(mongo, config, op, outputChs); err != nil {
+					if err := processRelated(mongo, bulk, elasticClient, config, op, outputChs); err != nil {
 						processErr(err, config)
 					}
 				}
@@ -3978,39 +4213,42 @@ func main() {
 			}
 		}()
 	}
+	var tearDown = func() {
+		infoLog.Println("Stopping all workers")
+		gtmCtx.Stop()
+		<-opsConsumed
+		close(outputChs.relateC)
+		relateWg.Wait()
+		close(outputChs.fileC)
+		fileWg.Wait()
+		close(outputChs.indexC)
+		indexWg.Wait()
+		close(outputChs.processC)
+		processWg.Wait()
+		doneC <- 30
+	}
 	if len(config.DirectReadNs) > 0 {
 		go func() {
 			gtmCtx.DirectReadWg.Wait()
 			infoLog.Println("Direct reads completed")
+			if config.Resume {
+				saveTimestampFromReplStatus(mongo, config)
+			}
 			if config.ExitAfterDirectReads {
-				gtmCtx.Stop()
-				<-opsConsumed
-				close(outputChs.relateC)
-				relateWg.Wait()
-				close(outputChs.fileC)
-				fileWg.Wait()
-				close(outputChs.indexC)
-				indexWg.Wait()
-				close(outputChs.processC)
-				processWg.Wait()
-				doneC <- 30
+				tearDown()
 			}
 		}()
 	}
+	go func() {
+		close(eventLoopC)
+		<-sigs
+		go func() {
+			<-sigs
+			os.Exit(exitStatus)
+		}()
+		tearDown()
+	}()
 	infoLog.Println("Listening for events")
-	if config.ClusterName != "" && !enabled {
-		gtmCtx.Pause()
-		bulk.Stop()
-		for range heartBeat.C {
-			enabled, err = enableProcess(mongo, config)
-			if enabled {
-				infoLog.Printf("Resuming work for cluster %s", config.ClusterName)
-				bulk.Start(context.Background())
-				resumeWork(gtmCtx, mongo, config)
-				break
-			}
-		}
-	}
 	for {
 		select {
 		case timeout := <-doneC:
@@ -4043,13 +4281,20 @@ func main() {
 					infoLog.Printf("Pausing work for cluster %s", config.ClusterName)
 					gtmCtx.Pause()
 					bulk.Stop()
-					for range heartBeat.C {
-						enabled, err = enableProcess(mongo, config)
-						if enabled {
-							infoLog.Printf("Resuming work for cluster %s", config.ClusterName)
-							bulk.Start(context.Background())
-							resumeWork(gtmCtx, mongo, config)
-							break
+					wait := true
+					for wait {
+						select {
+						case req := <-statusReqC:
+							req.responseC <- nil
+						case <-heartBeat.C:
+							enabled, err = enableProcess(mongo, config)
+							if enabled {
+								wait = false
+								infoLog.Printf("Resuming work for cluster %s", config.ClusterName)
+								bulk.Start(context.Background())
+								resumeWork(gtmCtx, mongo, config)
+								break
+							}
 						}
 					}
 				}
@@ -4080,6 +4325,13 @@ func main() {
 					statsLog.Println(string(stats))
 				}
 			}
+		case req := <-statusReqC:
+			e, l := enabled, lastTimestamp
+			statusResp := &statusResponse{
+				enabled: e,
+				lastTs:  l,
+			}
+			req.responseC <- statusResp
 		case err = <-gtmCtx.ErrC:
 			if err == nil {
 				break
